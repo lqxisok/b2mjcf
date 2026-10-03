@@ -6,9 +6,8 @@ It exports a portable MJCF bundle without changing the source Blender scene.
 ## Install
 
 1. In Blender 4.5, open `Edit > Preferences > Add-ons > Install...`.
-2. Build and select `dist/blender_mjcf_exporter_45_addon.zip` from this
-   repository. The archive contains `blender_mjcf_exporter_45/` as its
-   top-level add-on package.
+2. Select `tools/blender_mjcf_exporter_45_addon.zip`. The archive contains
+   `blender_mjcf_exporter_45/` as its top-level add-on package.
 3. Enable **Import-Export: MJCF Exporter 4.5**.
 
 The exporter is available in `File > Export > MuJoCo MJCF (.xml)` and in the
@@ -62,5 +61,11 @@ namespacing is added.
 Convex hulls are generated per Blender mesh object. Avoid putting an entire
 station into one disconnected Blender object; split floors, walls, columns,
 and props into separate objects so each receives an appropriately sized
-collision hull. Use **Exact Mesh** only when the triangle count is suitable
-for MuJoCo contact simulation.
+collision hull. Imported zero-thickness floors and decals are automatically
+given a tiny thickness in the collision copy, while the visual mesh remains
+unchanged. Use **Exact Mesh** only when the triangle count is suitable for
+MuJoCo contact simulation.
+
+Scene mesh assets are emitted with `inertia="shell"`, the valid MuJoCo MJCF
+form for shell inertia. `shellinertia="true"` is a USD-side property and is
+not a valid MuJoCo 3.11 XML attribute.

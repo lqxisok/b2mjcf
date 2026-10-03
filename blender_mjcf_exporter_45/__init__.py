@@ -219,6 +219,7 @@ def _export_object_mesh(obj, destination: Path, collision_mode: str, scale: Vect
 
 def _convex_mesh(obj) -> bpy.types.Mesh:
     mesh = obj.data.copy()
+    _thicken_degenerate_mesh(mesh)
     bm = bmesh.new()
     try:
         bm.from_mesh(mesh)
@@ -248,13 +249,60 @@ def _box_mesh(obj) -> bpy.types.Mesh:
     return mesh
 
 
+def _thicken_degenerate_mesh(mesh: bpy.types.Mesh) -> bpy.types.Mesh:
+    """Give planar collision meshes a tiny physical thickness.
+
+    Blender scenes commonly contain floors, decals, and wall cards made from
+    coplanar triangles. MuJoCo cannot build a convex collision hull or volume
+    inertia from an exactly zero-thickness mesh. The visual mesh is untouched;
+    only the temporary collision copy is expanded by a scale-aware epsilon.
+    """
+    if not mesh.vertices:
+        return mesh
+    coordinates = [vertex.co.copy() for vertex in mesh.vertices]
+    mins = [min(coordinate[index] for coordinate in coordinates) for index in range(3)]
+    maxs = [max(coordinate[index] for coordinate in coordinates) for index in range(3)]
+    extents = [maxs[index] - mins[index] for index in range(3)]
+    largest = max(extents)
+    if largest <= 0.0:
+        return mesh
+    epsilon = max(largest * 1.0e-4, 1.0e-5)
+    thin_axis = min(range(3), key=extents.__getitem__)
+    if extents[thin_axis] >= epsilon:
+        return mesh
+    center = (mins[thin_axis] + maxs[thin_axis]) * 0.5
+    half = epsilon * 0.5
+    original_vertices = [vertex.co.copy() for vertex in mesh.vertices]
+    original_faces = [tuple(polygon.vertices) for polygon in mesh.polygons if len(polygon.vertices) >= 3]
+    if not original_faces:
+        return mesh
+    vertices = []
+    for layer in (-half, half):
+        for coordinate in original_vertices:
+            copy = coordinate.copy()
+            copy[thin_axis] = center + layer
+            vertices.append(tuple(copy))
+    count = len(original_vertices)
+    faces = []
+    for polygon in original_faces:
+        bottom = tuple(count_index for count_index in reversed(polygon))
+        top = tuple(count + count_index for count_index in polygon)
+        faces.extend((bottom, top))
+        for first, second in zip(polygon, polygon[1:] + polygon[:1]):
+            faces.append((first, second, count + second, count + first))
+    mesh.clear_geometry()
+    mesh.from_pydata(vertices, [], faces)
+    mesh.update()
+    return mesh
+
+
 def _collision_mesh_for(obj, mode: str):
     if mode == "MESH":
-        return obj.data.copy()
+        return _thicken_degenerate_mesh(obj.data.copy())
     if mode == "CONVEX_HULL":
         return _convex_mesh(obj)
     if mode == "BOX":
-        return _box_mesh(obj)
+        return _thicken_degenerate_mesh(_box_mesh(obj))
     return None
 
 
@@ -291,12 +339,15 @@ class _Writer:
         })
         self.default = ET.SubElement(self.root, "default")
         ET.SubElement(self.default, "default", {"class": "mjcf_visual"}).append(
-            ET.Element("geom", {"type": "mesh", "contype": "0", "conaffinity": "0", "group": "2"})
+            ET.Element("geom", {
+                "type": "mesh", "contype": "0", "conaffinity": "0",
+                "group": "2", "density": "0",
+            })
         )
         ET.SubElement(self.default, "default", {"class": "mjcf_collision"}).append(
             ET.Element("geom", {
                 "type": "mesh", "contype": "1", "conaffinity": "1", "group": "3",
-                "condim": "3", "friction": "1 0.5 0.02",
+                "condim": "3", "friction": "1 0.5 0.02", "density": "0",
             })
         )
         self.asset = ET.SubElement(self.root, "asset")
@@ -319,7 +370,13 @@ class _Writer:
         if name in self._mesh_names:
             return
         self._mesh_names.add(name)
-        ET.SubElement(self.asset, "mesh", {"name": name, "file": _relative_file(path, self.bundle.root_dir)})
+        ET.SubElement(self.asset, "mesh", {
+            "name": name,
+            "file": _relative_file(path, self.bundle.root_dir),
+            # Scene geoms are static. Shell mesh inertia supports imported
+            # visual cards and floors whose mesh volume is exactly zero.
+            "inertia": "shell",
+        })
 
     def _add_material_assets(self, objects: Iterable[bpy.types.Object]):
         for obj in objects:
@@ -349,7 +406,18 @@ class _Writer:
     def _export_meshes(self, obj: bpy.types.Object, visual_name: str, collision_name: str | None,
                        scale: Vector):
         visual_path = self.bundle.mesh_dir / f"{visual_name}{self.extension}"
-        _export_object_mesh(obj, visual_path, self.collision_mode, scale)
+        # A mesh asset still needs at least four non-coplanar vertices even
+        # with shell inertia (single-triangle decals are common). Export a
+        # temporary, imperceptibly thin copy for these degenerate surfaces.
+        visual_mesh = obj.data.copy()
+        _thicken_degenerate_mesh(visual_mesh)
+        visual_temp = obj.copy()
+        visual_temp.data = visual_mesh
+        try:
+            _export_object_mesh(visual_temp, visual_path, self.collision_mode, scale)
+        finally:
+            bpy.data.objects.remove(visual_temp, do_unlink=True)
+            bpy.data.meshes.remove(visual_mesh)
         self._add_mesh_asset(visual_name, visual_path)
         if collision_name is None:
             return
